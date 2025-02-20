@@ -59,10 +59,10 @@ class Pipe:
             description="API key for Tavily search service",
         )
         MAX_SEARCH_RESULTS: int = Field(
-            default=3, description="Maximum number of search results to fetch per query"
+            default=5, description="Maximum number of search results to fetch per query"
         )
         ARXIV_MAX_RESULTS: int = Field(
-            default=3, description="Maximum number of arXiv papers to fetch"
+            default=5, description="Maximum number of arXiv papers to fetch"
         )
         TREE_DEPTH: int = Field(
             default=4, description="Maximum depth of the research tree"
@@ -82,7 +82,7 @@ class Pipe:
             description="Activates Temperature Dynamic mapping, giving higher creativity for lower scored parent nodes",
         )
         TEMPERATURE_MAX: float = Field(
-            default=1.4,
+            default=0.5,
             description="Temperature for starting the research process with Temperature decay if active",
         )
         TEMPERATURE_MIN: float = Field(
@@ -132,6 +132,82 @@ class Pipe:
             logger.error(f"arXiv search error: {e}")
         return []
 
+    async def search_pubmed(self, query: str) -> List[Dict]:
+        """Gather research from PubMed using NCBI's E-utilities."""
+        await self.emit_status(
+            "tool", f"Fetching PubMed articles for: {query}...", False
+        )
+        try:
+            base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+            search_url = base_url + "esearch.fcgi"
+            fetch_url = base_url + "efetch.fcgi"
+            params = {
+                "db": "pubmed",
+                "term": query,
+                "retmode": "json",
+                "retmax": self.valves.MAX_SEARCH_RESULTS,
+            }
+            logger.debug(f"pub_med_params: {params}")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(search_url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        id_list = data.get("esearchresult", {}).get("idlist", [])
+                        if not id_list:
+                            await self.emit_status(
+                                "tool", "No PubMed articles found.", False
+                            )
+                            return []
+                        # Fetch details for each article using EFetch
+                        fetch_params = {
+                            "db": "pubmed",
+                            "id": ",".join(id_list),
+                            "retmode": "xml",
+                        }
+                        async with session.get(
+                            fetch_url, params=fetch_params
+                        ) as fetch_response:
+                            if fetch_response.status == 200:
+                                text = await fetch_response.text()
+                                soup = BeautifulSoup(text, "xml")
+                                articles = []
+                                for article in soup.find_all("PubmedArticle"):
+                                    title_tag = article.find("ArticleTitle")
+                                    abstract_tag = article.find("AbstractText")
+                                    article_id = article.find("PMID")
+                                    title = title_tag.text if title_tag else "No title"
+                                    abstract = (
+                                        abstract_tag.text
+                                        if abstract_tag
+                                        else "No abstract"
+                                    )
+                                    pmid = article_id.text if article_id else "N/A"
+                                    articles.append(
+                                        {
+                                            "title": title,
+                                            "content": abstract,
+                                            "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                                        }
+                                    )
+                                await self.emit_status(
+                                    "tool",
+                                    f"PubMed articles found: {len(articles)}",
+                                    False,
+                                )
+                                logger.debug(f"pub_med_articles: {articles}")
+
+                                return articles
+                    else:
+                        await self.emit_status(
+                            "tool",
+                            f"PubMed search error: HTTP {response.status}",
+                            False,
+                        )
+        except Exception as e:
+            logger.error(f"PubMed search error: {e}")
+        return []
+
     async def search_web(self, query: str) -> List[Dict]:
         if not self.valves.TAVILY_API_KEY:
             return []
@@ -168,53 +244,45 @@ class Pipe:
 
     async def gather_research(self, topic: str) -> List[Dict]:
         await self.emit_status("tool", "Researching...", False)
-        web_query, arxiv_query = await self.preprocess_query(topic)
-        logger.debug(f"Enhanced queries - arXiv: {arxiv_query}")
-
+        web_query, arxiv_query, pubmed_query = await self.preprocess_query(topic)
         await self.emit_status(
-            "tool",
-            f"Enhanced queries - Web: {web_query} | arXiv: {arxiv_query}",
-            False,
+            "tool", f"Enhanced queries - Web: {web_query} | arXiv: {arxiv_query}", False
         )
-        # web_research = []  # Web search disabled in this version
-        web_research = await self.search_web(web_query)
 
-        await self.emit_status("tool", f"Web sources found: {len(web_research)}", False)
+        # Existing research methods:
+        web_research = []  # if using a web search, or integrate as needed
         arxiv_research = await self.search_arxiv(arxiv_query)
-        logger.debug(f"arxiv_research: {arxiv_research}")
-        await self.emit_status(
-            "tool", f"ArXiv papers found: {len(arxiv_research)}", False
-        )
-        research = web_research + arxiv_research
-        logger.debug(
-            f"Research Result: ArXiv papers: {len(arxiv_research)}, Web sources: {len(web_research)}"
-        )
+
+        # New: PubMed research
+        pubmed_research = await self.search_pubmed(pubmed_query)
+
+        research = web_research + arxiv_research + pubmed_research
         await self.emit_status(
             "user",
-            f"Research gathered: ArXiv papers: {len(arxiv_research)}, Web sources: {len(web_research)}",
+            f"Research gathered: ArXiv papers: {len(arxiv_research)}, PubMed articles: {len(pubmed_research)}, web research: {len(web_research)}",
             True,
         )
         return research
 
-    async def preprocess_query(self, query: str) -> tuple[str, str]:
+    async def preprocess_query(self, query: str) -> tuple[str, str, str]:
         prompt_web = f"""
         Enhance the following query to improve the relevance of web search results:
-        - Focus on adding relevant keywords, synonyms, or contextual phrases
-        - Only output the enhanced query without explanations
-
+        - Focus on adding relevant keywords, synonyms, or contextual phrases.
+        - Only output the enhanced query without explanations.
+    
         Initial query: "{query}"
-
+    
         Enhanced web search query:
         """
         web_query = await self.get_completion(prompt_web)
 
         prompt_arxiv = f"""
         Format an optimized query for the arXiv API based on the following input:
-        - Use arXiv's query syntax (AND, OR, NOT) and search fields (ti, au, abs, cat)
-        - Only output the formatted arXiv API query without explanations
-
+        - Use arXiv's query syntax (AND, OR, NOT) and search fields (ti, au, abs, cat).
+        - Only output the formatted arXiv API query without explanations.
+    
         Initial query: "{query}"
-
+    
         arXiv categories:
         - cs.AI: Artificial Intelligence
         - cs.LG: Machine Learning 
@@ -227,12 +295,28 @@ class Pipe:
         - q-bio: Quantitative Biology
         - q-fin: Quantitative Finance
         - econ: Economics
-
+    
         Enhanced arXiv search query (API format):
         """
         arxiv_query = await self.get_completion(prompt_arxiv)
 
-        return web_query, arxiv_query
+        prompt_pubmed = f"""
+        Format an optimized query for PubMed based on the following input:
+        - Use PubMed's search syntax including MeSH terms, boolean operators (AND, OR, NOT), and field tags (e.g., [Mesh], [Title/Abstract]) if applicable.
+        - For example, you might use:
+          • "Neurogenesis"[Mesh] OR neurogenesis[Title/Abstract]
+          • "Aged, Mice"[Mesh] OR "aged mice"[Title/Abstract]
+          • treatment[Title/Abstract] OR therapeutics[Title/Abstract]
+        - Combine terms using AND/OR as needed.
+        - Only output the formatted PubMed query without explanations.
+    
+        Initial query: "{query}"
+    
+        Enhanced PubMed search query:
+        """
+        pubmed_query = await self.get_completion(prompt_pubmed)
+
+        return web_query, arxiv_query, pubmed_query
 
     async def get_streaming_completion(
         self, messages, temperature: float = 1
@@ -411,17 +495,17 @@ class Pipe:
         # initial_research = await self.gather_research(topic)
         #         # Initial research
         initial_research_1 = await self.gather_research(topic)
-        initial_research_2 = await self.gather_research(topic)
-        initial_research_3 = await self.gather_research(topic)
-        initial_research_4 = await self.gather_research(topic)
-        initial_research_5 = await self.gather_research(topic)
+        # initial_research_2 = await self.gather_research(topic)
+        # initial_research_3 = await self.gather_research(topic)
+        # initial_research_4 = await self.gather_research(topic)
+        # initial_research_5 = await self.gather_research(topic)
 
         initial_research = (
             initial_research_1
-            + initial_research_2
-            + initial_research_3
-            + initial_research_4
-            + initial_research_5
+            # + initial_research_2
+            # + initial_research_3
+            # + initial_research_4
+            # + initial_research_5
         )
 
         initial_content = await self.synthesize_research(
