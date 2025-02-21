@@ -1,6 +1,6 @@
 """
 title: arXiv Research Pipe
-description: Function Pipe made to create summary of searches using arXiv.org for relevant papers on a topic and web scrape for more contextual information.
+description: Function Pipe made to create summary of searches using arXiv.org for relevant papers on a topic, along with PubMed, Zenodo, OpenAIRE, Europe PMC, and web searches for more contextual scientific information.
 author: Haervwe
 author_url: https://github.com/Haervwe/open-webui-tools/
 funding_url: https://github.com/Haervwe/open-webui-tools
@@ -104,6 +104,9 @@ class Pipe:
     def resolve_question(self, body: dict) -> str:
         return body.get("messages")[-1].get("content").strip()
 
+    # ---------------------------
+    # Repository Search Functions
+    # ---------------------------
     async def search_arxiv(self, query: str) -> List[Dict]:
         await self.emit_status("tool", f"Fetching arXiv papers for: {query}...", False)
         try:
@@ -148,7 +151,6 @@ class Pipe:
                 "retmax": self.valves.MAX_SEARCH_RESULTS,
             }
             logger.debug(f"pub_med_params: {params}")
-
             async with aiohttp.ClientSession() as session:
                 async with session.get(search_url, params=params) as response:
                     if response.status == 200:
@@ -159,7 +161,6 @@ class Pipe:
                                 "tool", "No PubMed articles found.", False
                             )
                             return []
-                        # Fetch details for each article using EFetch
                         fetch_params = {
                             "db": "pubmed",
                             "id": ",".join(id_list),
@@ -196,7 +197,6 @@ class Pipe:
                                     False,
                                 )
                                 logger.debug(f"pub_med_articles: {articles}")
-
                                 return articles
                     else:
                         await self.emit_status(
@@ -206,6 +206,104 @@ class Pipe:
                         )
         except Exception as e:
             logger.error(f"PubMed search error: {e}")
+        return []
+
+    async def search_zenodo(self, query: str) -> List[Dict]:
+        """Search Zenodo for open access records."""
+        await self.emit_status(
+            "tool", f"Fetching Zenodo records for: {query}...", False
+        )
+        try:
+            zenodo_url = "https://zenodo.org/api/records/"
+            params = {
+                "q": query,
+                "size": self.valves.MAX_SEARCH_RESULTS,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(zenodo_url, params=params) as response:
+                    logger.debug(f"Zenodo API response status: {response.status}")
+                    if response.status == 200:
+                        data = await response.json()
+                        records = data.get("hits", {}).get("hits", [])
+                        results = []
+                        for rec in records:
+                            metadata = rec.get("metadata", {})
+                            results.append(
+                                {
+                                    "title": metadata.get("title", "No title"),
+                                    "content": metadata.get(
+                                        "description", "No description"
+                                    ),
+                                    "url": rec.get("links", {}).get("html", ""),
+                                }
+                            )
+                        return results
+        except Exception as e:
+            logger.error(f"Zenodo search error: {e}")
+        return []
+
+    async def search_openaire(self, query: str) -> List[Dict]:
+        """Search OpenAIRE for publications."""
+        await self.emit_status(
+            "tool", f"Fetching OpenAIRE records for: {query}...", False
+        )
+        try:
+            openaire_url = "https://api.openaire.eu/search/publications"
+            params = {"keywords": query, "size": self.valves.MAX_SEARCH_RESULTS}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(openaire_url, params=params) as response:
+                    logger.debug(f"OpenAIRE API response status: {response.status}")
+                    if response.status == 200:
+                        data = await response.json()
+                        results = []
+                        for rec in data.get("response", {}).get("results", []):
+                            results.append(
+                                {
+                                    "title": rec.get("title", "No title"),
+                                    "content": rec.get("description", "No description"),
+                                    "url": rec.get("uri", ""),
+                                }
+                            )
+                        return results
+        except Exception as e:
+            logger.error(f"OpenAIRE search error: {e}")
+        return []
+
+    async def search_europepmc(self, query: str) -> List[Dict]:
+        """Search Europe PMC for open access articles."""
+        await self.emit_status(
+            "tool", f"Fetching Europe PMC articles for: {query}...", False
+        )
+        try:
+            europepmc_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+            params = {
+                "query": query,
+                "format": "json",
+                "pageSize": self.valves.MAX_SEARCH_RESULTS,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(europepmc_url, params=params) as response:
+                    logger.debug(f"Europe PMC response status: {response.status}")
+                    if response.status == 200:
+                        data = await response.json()
+                        results = []
+                        for rec in data.get("resultList", {}).get("result", []):
+                            results.append(
+                                {
+                                    "title": rec.get("title", "No title"),
+                                    "content": rec.get("abstractText", "No abstract"),
+                                    "url": (
+                                        rec.get("fullTextUrlList", {})
+                                        .get("fullTextUrl", [{}])[0]
+                                        .get("url", "")
+                                        if rec.get("fullTextUrlList")
+                                        else ""
+                                    ),
+                                }
+                            )
+                        return results
+        except Exception as e:
+            logger.error(f"Europe PMC search error: {e}")
         return []
 
     async def search_web(self, query: str) -> List[Dict]:
@@ -228,12 +326,12 @@ class Pipe:
                         results = result.get("results", [])
                         return [
                             {
-                                "title": result["title"],
-                                "url": result["url"],
-                                "content": result["content"],
-                                "score": result["score"],
+                                "title": res["title"],
+                                "url": res["url"],
+                                "content": res["content"],
+                                "score": res["score"],
                             }
-                            for result in results
+                            for res in results
                         ]
                     else:
                         logger.error(f"Tavily API error: {response.status}")
@@ -242,29 +340,10 @@ class Pipe:
                 logger.error(f"Search error: {e}")
                 return []
 
-    async def gather_research(self, topic: str) -> List[Dict]:
-        await self.emit_status("tool", "Researching...", False)
-        web_query, arxiv_query, pubmed_query = await self.preprocess_query(topic)
-        await self.emit_status(
-            "tool", f"Enhanced queries - Web: {web_query} | arXiv: {arxiv_query}", False
-        )
-
-        # Existing research methods:
-        web_research = []  # if using a web search, or integrate as needed
-        arxiv_research = await self.search_arxiv(arxiv_query)
-
-        # New: PubMed research
-        pubmed_research = await self.search_pubmed(pubmed_query)
-
-        research = web_research + arxiv_research + pubmed_research
-        await self.emit_status(
-            "user",
-            f"Research gathered: ArXiv papers: {len(arxiv_research)}, PubMed articles: {len(pubmed_research)}, web research: {len(web_research)}",
-            True,
-        )
-        return research
-
-    async def preprocess_query(self, query: str) -> tuple[str, str, str]:
+    # ---------------------------
+    # Research Aggregation
+    # ---------------------------
+    async def preprocess_query(self, query: str) -> tuple[str, str, str, str, str, str]:
         prompt_web = f"""
         Enhance the following query to improve the relevance of web search results:
         - Focus on adding relevant keywords, synonyms, or contextual phrases.
@@ -316,7 +395,84 @@ class Pipe:
         """
         pubmed_query = await self.get_completion(prompt_pubmed)
 
-        return web_query, arxiv_query, pubmed_query
+        prompt_zenodo = f"""
+        Format an optimized query for Zenodo based on the following input:
+        - Focus on adding relevant keywords that align with Zenodo's record metadata.
+        - Only output the formatted query without explanations.
+    
+        Initial query: "{query}"
+    
+        Enhanced Zenodo search query:
+        """
+        zenodo_query = await self.get_completion(prompt_zenodo)
+
+        prompt_openaire = f"""
+        Format an optimized query for OpenAIRE based on the following input:
+        - Use OpenAIRE's search syntax and focus on keywords that match their publication records.
+        - Only output the formatted query without explanations.
+    
+        Initial query: "{query}"
+    
+        Enhanced OpenAIRE search query:
+        """
+        openaire_query = await self.get_completion(prompt_openaire)
+
+        prompt_europepmc = f"""
+        Format an optimized query for Europe PMC based on the following input:
+        - Use Europe PMC's search syntax, focusing on relevant keywords.
+        - Only output the formatted query without explanations.
+    
+        Initial query: "{query}"
+    
+        Enhanced Europe PMC search query:
+        """
+        europepmc_query = await self.get_completion(prompt_europepmc)
+
+        return (
+            web_query,
+            arxiv_query,
+            pubmed_query,
+            zenodo_query,
+            openaire_query,
+            europepmc_query,
+        )
+
+    async def gather_research(self, topic: str) -> List[Dict]:
+        await self.emit_status("tool", "Researching...", False)
+        (
+            web_query,
+            arxiv_query,
+            pubmed_query,
+            zenodo_query,
+            openaire_query,
+            europepmc_query,
+        ) = await self.preprocess_query(topic)
+        await self.emit_status(
+            "tool", f"Enhanced queries - Web: {web_query} | arXiv: {arxiv_query}", False
+        )
+
+        # Perform searches across multiple repositories using optimized queries:
+        web_research = await self.search_web(web_query)
+        arxiv_research = await self.search_arxiv(arxiv_query)
+        pubmed_research = await self.search_pubmed(pubmed_query)
+        zenodo_research = await self.search_zenodo(zenodo_query)
+        openaire_research = await self.search_openaire(openaire_query)
+        europepmc_research = await self.search_europepmc(europepmc_query)
+
+        research = (
+            web_research
+            + arxiv_research
+            + pubmed_research
+            + zenodo_research
+            + openaire_research
+            + europepmc_research
+        )
+        await self.emit_status(
+            "user",
+            f"Research gathered: ArXiv: {len(arxiv_research)}, PubMed: {len(pubmed_research)}, Zenodo: {len(zenodo_research)}, OpenAIRE: {len(openaire_research)}, EuropePMC: {len(europepmc_research)}, Web: {len(web_research)}",
+            True,
+        )
+        return research
 
     async def get_streaming_completion(
         self, messages, temperature: float = 1
@@ -329,9 +485,7 @@ class Pipe:
                 "temperature": temperature,
             }
             response = await generate_chat_completions(
-                self.__request__,
-                form_data,
-                user=self.__user__,
+                self.__request__, form_data, user=self.__user__
             )
             if not hasattr(response, "body_iterator"):
                 raise ValueError("Response does not support streaming")
@@ -364,30 +518,68 @@ class Pipe:
         """
         return await self.get_completion(prompt)
 
+    # async def synthesize_research(
+    #     self, research: List[Dict], topic: str, temperature
+    # ) -> str:
+    #     research_text = "\n\n".join(
+    #         f"Title: {r['title']}\nContent: {r['content']}\nURL: {r['url']}"
+    #         for r in research
+    #     )
+    #     prompt = f"""
+    #     Create a research synthesis on the topic: {topic}
+
+    #     Available research:
+    #     {research_text}
+
+    #     Create a comprehensive synthesis that:
+    #     1. Integrates the sources with links.
+    #     2. Highlights key findings.
+    #     3. Maintains academic rigor while being accessible.
+    #     """
+    #     complete = ""
+    #     async for chunk in self.get_streaming_completion(
+    #         [{"role": "user", "content": prompt}], temperature
+    #     ):
+    #         complete += chunk
+    #         await self.emit_message(chunk)
+    #     return complete
+
     async def synthesize_research(
         self, research: List[Dict], topic: str, temperature
     ) -> str:
+        # Create the main research synthesis text from the gathered research
         research_text = "\n\n".join(
             f"Title: {r['title']}\nContent: {r['content']}\nURL: {r['url']}"
             for r in research
         )
+        # Create a complete list of resources (titles and links) at the end
+        resource_list = "\n".join(
+            f"- {r['title']}: {r['url']}" for r in research if r.get("url")
+        )
         prompt = f"""
-        Create a research synthesis on the topic: {topic}
-
-        Available research:
-        {research_text}
-
-        Create a comprehensive synthesis that:
-        1. Integrates the sources with links
-        2. Highlights key findings
-        3. Maintains academic rigor while being accessible
-        """
+            Create a research synthesis on the topic: {topic}
+    
+            Available research:
+            {research_text}
+    
+            Create a comprehensive synthesis that:
+            1. Integrates the sources with links.
+            2. Highlights key findings.
+            3. Maintains academic rigor while being accessible.
+            
+            At the end of the synthesis, include a section titled "Complete Resource List" that lists all resources with their titles and URLs, one per line.
+            """
         complete = ""
         async for chunk in self.get_streaming_completion(
             [{"role": "user", "content": prompt}], temperature
         ):
             complete += chunk
             await self.emit_message(chunk)
+
+        # Ensure the complete resource list is appended if not already included.
+        if "Complete Resource List" not in complete:
+            complete += "\n\nComplete Resource List:\n" + resource_list
+
         return complete
 
     async def evaluate_content(self, content: str, topic: str) -> float:
@@ -451,8 +643,7 @@ class Pipe:
     async def stream_prompt_completion(self, prompt, **format_args):
         complete = ""
         async for chunk in self.get_message_completion(
-            self.__model__,
-            prompt.format(**format_args),
+            self.__model__, prompt.format(**format_args)
         ):
             complete += chunk
             await self.emit_message(chunk)
@@ -491,23 +682,9 @@ class Pipe:
         initial_temperature = (
             self.valves.TEMPERATURE_MAX if self.valves.TEMPERATURE_DECAY else 1
         )
-        # Gather initial research and synthesize content directly
-        # initial_research = await self.gather_research(topic)
-        #         # Initial research
-        initial_research_1 = await self.gather_research(topic)
-        # initial_research_2 = await self.gather_research(topic)
-        # initial_research_3 = await self.gather_research(topic)
-        # initial_research_4 = await self.gather_research(topic)
-        # initial_research_5 = await self.gather_research(topic)
 
-        initial_research = (
-            initial_research_1
-            # + initial_research_2
-            # + initial_research_3
-            # + initial_research_4
-            # + initial_research_5
-        )
-
+        # Gather initial research from all sources
+        initial_research = await self.gather_research(topic)
         initial_content = await self.synthesize_research(
             initial_research, topic, initial_temperature
         )
